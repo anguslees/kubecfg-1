@@ -107,6 +107,19 @@ func runKubecfgWith(flags []string, input []runtime.Object) error {
 		return err
 	}
 
+	// For debugging tests
+	if false {
+		f, err := os.Open(fname)
+		defer f.Close()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(GinkgoWriter, "kubecfg input is:\n")
+		if _, err := io.Copy(GinkgoWriter, f); err != nil {
+			return err
+		}
+	}
+
 	args := []string{}
 	if *kubeconfig != "" && !containsString(flags, "--kubeconfig") {
 		args = append(args, "--kubeconfig", *kubeconfig)
