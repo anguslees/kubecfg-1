@@ -22,7 +22,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/discovery"
 
 	"github.com/ksonnet/kubecfg/utils"
@@ -34,29 +34,12 @@ type ValidateCmd struct {
 	IgnoreUnknown bool
 }
 
-// newGroupVersionChecker returns a predicate that returns true if the group version is known to the server.
-func newGroupVersionChecker(d discovery.ServerGroupsInterface) (func(schema.GroupVersion) bool, error) {
-	groupList, err := d.ServerGroups()
-	if err != nil {
-		return nil, err
-	}
-	groupVersions := v1.ExtractGroupVersions(groupList)
-
-	return func(gv schema.GroupVersion) bool {
-		for _, v := range groupVersions {
-			if v == gv.String() {
-				return true
-			}
-		}
-		return false
-	}, nil
-}
-
 func (c ValidateCmd) Run(apiObjects []*unstructured.Unstructured, out io.Writer) error {
-	isGroupVersionKnown, err := newGroupVersionChecker(c.Discovery)
+	groupList, err := c.Discovery.ServerGroups()
 	if err != nil {
 		return err
 	}
+	groupVersions := sets.NewString(v1.ExtractGroupVersions(groupList)...)
 
 	hasError := false
 
@@ -65,7 +48,7 @@ func (c ValidateCmd) Run(apiObjects []*unstructured.Unstructured, out io.Writer)
 		log.Info("Validating ", desc)
 
 		gv := obj.GroupVersionKind().GroupVersion()
-		if c.IgnoreUnknown && !isGroupVersionKnown(gv) {
+		if c.IgnoreUnknown && !groupVersions.Has(gv.String()) {
 			log.Warnf("Skipping validation of %s because schema for %s is unknown", desc, gv)
 			continue
 		}
