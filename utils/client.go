@@ -17,6 +17,7 @@ package utils
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/emicklei/go-restful-swagger12"
@@ -33,12 +34,15 @@ import (
 )
 
 type memcachedDiscoveryClient struct {
-	cl              discovery.DiscoveryInterface
-	lock            sync.RWMutex
+	cl   discovery.DiscoveryInterface
+	lock sync.RWMutex
+
+	// Remember to update Invalidate() below when adding fields
 	servergroups    *metav1.APIGroupList
 	serverresources map[string]*metav1.APIResourceList
 	schemas         map[string]*swagger.ApiDeclaration
 	schema          *openapi_v2.Document
+	serverVersion   *version.Info
 }
 
 // NewMemcachedDiscoveryClient creates a new DiscoveryClient that
@@ -60,6 +64,8 @@ func (c *memcachedDiscoveryClient) Invalidate() {
 	c.servergroups = nil
 	c.serverresources = make(map[string]*metav1.APIResourceList)
 	c.schemas = make(map[string]*swagger.ApiDeclaration)
+	c.schema = nil
+	c.serverVersion = nil
 }
 
 func (c *memcachedDiscoveryClient) RESTClient() rest.Interface {
@@ -91,19 +97,102 @@ func (c *memcachedDiscoveryClient) ServerResourcesForGroupVersion(groupVersion s
 }
 
 func (c *memcachedDiscoveryClient) ServerResources() ([]*metav1.APIResourceList, error) {
-	return c.cl.ServerResources()
+	apiGroups, err := c.ServerGroups()
+	if err != nil {
+		return nil, err
+	}
+
+	result := []*metav1.APIResourceList{}
+
+	for _, apiGroup := range apiGroups.Groups {
+		for _, version := range apiGroup.Versions {
+			resources, err := c.ServerResourcesForGroupVersion(version.GroupVersion)
+			if err != nil {
+				return nil, err
+			}
+
+			result = append(result, resources)
+		}
+	}
+
+	return result, nil
 }
 
 func (c *memcachedDiscoveryClient) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
-	return c.cl.ServerPreferredResources()
+	serverGroupList, err := c.ServerGroups()
+	if err != nil {
+		return nil, err
+	}
+
+	result := []*metav1.APIResourceList{}
+
+	grVersions := map[schema.GroupResource]string{}                         // selected version of a GroupResource
+	grApiResources := map[schema.GroupResource]*metav1.APIResource{}        // selected APIResource for a GroupResource
+	gvApiResourceLists := map[schema.GroupVersion]*metav1.APIResourceList{} // blueprint for a APIResourceList for later grouping
+
+	for _, apiGroup := range serverGroupList.Groups {
+		for _, version := range apiGroup.Versions {
+			groupVersion := schema.GroupVersion{Group: apiGroup.Name, Version: version.Version}
+			apiResourceList, err := c.ServerResourcesForGroupVersion(version.GroupVersion)
+			if err != nil {
+				return nil, err
+			}
+
+			// create empty list which is filled later in another loop
+			emptyApiResourceList := metav1.APIResourceList{
+				GroupVersion: version.GroupVersion,
+			}
+			gvApiResourceLists[groupVersion] = &emptyApiResourceList
+			result = append(result, &emptyApiResourceList)
+
+			for i := range apiResourceList.APIResources {
+				apiResource := &apiResourceList.APIResources[i]
+				if strings.Contains(apiResource.Name, "/") {
+					continue
+				}
+				gv := schema.GroupResource{Group: apiGroup.Name, Resource: apiResource.Name}
+				if _, ok := grApiResources[gv]; ok && version.Version != apiGroup.PreferredVersion.Version {
+					// only override with preferred version
+					continue
+				}
+				grVersions[gv] = version.Version
+				grApiResources[gv] = apiResource
+			}
+		}
+	}
+
+	// group selected APIResources according to GroupVersion into APIResourceLists
+	for groupResource, apiResource := range grApiResources {
+		version := grVersions[groupResource]
+		groupVersion := schema.GroupVersion{Group: groupResource.Group, Version: version}
+		apiResourceList := gvApiResourceLists[groupVersion]
+		apiResourceList.APIResources = append(apiResourceList.APIResources, *apiResource)
+	}
+
+	return result, nil
 }
 
 func (c *memcachedDiscoveryClient) ServerPreferredNamespacedResources() ([]*metav1.APIResourceList, error) {
-	return c.cl.ServerPreferredNamespacedResources()
+	all, err := c.ServerPreferredResources()
+	return discovery.FilteredBy(discovery.ResourcePredicateFunc(
+		func(gv string, r *metav1.APIResource) bool {
+			return r.Namespaced
+		}), all), err
 }
 
 func (c *memcachedDiscoveryClient) ServerVersion() (*version.Info, error) {
-	return c.cl.ServerVersion()
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if c.serverVersion == nil {
+		info, err := c.cl.ServerVersion()
+		if err != nil {
+			return nil, err
+		}
+		c.serverVersion = info
+	}
+
+	return c.serverVersion, nil
 }
 
 func (c *memcachedDiscoveryClient) SwaggerSchema(version schema.GroupVersion) (*swagger.ApiDeclaration, error) {
